@@ -3,39 +3,52 @@ using System.Diagnostics;
 using System.Drawing.Imaging;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Channels;
+using NAudio.CoreAudioApi;
+using NAudio.Wave;
 
 namespace CSUsbDisplayHost;
 
 internal static class Program
 {
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
-        Application.Run(new MainForm());
+        var autoStart = args.Any(x => x.Equals("--auto", StringComparison.OrdinalIgnoreCase));
+        Application.Run(new MainForm(autoStart));
     }
 }
 
 public sealed class MainForm : Form
 {
     private const int DevicePort = 27183;
+    private const byte PacketVideo = 1;
+    private const byte PacketAudio = 2;
+    private const byte PacketMic = 3;
+
     private readonly Button _start = new() { Text = "Connect / Start", Width = 150, Height = 36 };
     private readonly Button _stop = new() { Text = "Stop", Width = 90, Height = 36, Enabled = false };
-    private readonly Label _status = new() { AutoSize = true, Text = "Ready. Connect the tablet by USB." };
+    private readonly Button _refreshDisplays = new() { Text = "Refresh displays", Width = 120, Height = 30 };
+    private readonly ComboBox _display = new() { Width = 300, DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly Label _status = new() { AutoSize = true, MaximumSize = new Size(700, 0), Text = "Ready. Connect the tablet by USB." };
     private readonly NumericUpDown _fps = new() { Minimum = 5, Maximum = 30, Value = 20, Width = 60 };
     private readonly NumericUpDown _quality = new() { Minimum = 30, Maximum = 90, Value = 55, Width = 60 };
     private readonly NumericUpDown _width = new() { Minimum = 640, Maximum = 2560, Increment = 160, Value = 1280, Width = 80 };
+    private readonly CheckBox _sendAudio = new() { Text = "PC audio → tablet", Checked = true, AutoSize = true };
+    private readonly CheckBox _receiveMic = new() { Text = "Tablet mic → Windows", Checked = true, AutoSize = true };
 
     private CancellationTokenSource? _cts;
     private TcpListener? _listener;
     private string? _adbPath;
     private string? _deviceSerial;
+    private bool _starting;
 
-    public MainForm()
+    public MainForm(bool autoStart)
     {
-        Text = "CS USB Display v0.1.1";
-        Width = 540;
-        Height = 250;
+        Text = "CS USB Display v0.2.0 — Extended + Audio + Mic";
+        Width = 760;
+        Height = 310;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
 
@@ -51,6 +64,12 @@ public sealed class MainForm : Form
         panel.Controls.Add(_start);
         panel.Controls.Add(_stop);
         panel.SetFlowBreak(_stop, true);
+
+        panel.Controls.Add(new Label { Text = "Windows display", AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        panel.Controls.Add(_display);
+        panel.Controls.Add(_refreshDisplays);
+        panel.SetFlowBreak(_refreshDisplays, true);
+
         panel.Controls.Add(new Label { Text = "FPS", AutoSize = true, Margin = new Padding(4, 10, 4, 0) });
         panel.Controls.Add(_fps);
         panel.Controls.Add(new Label { Text = "JPEG quality", AutoSize = true, Margin = new Padding(16, 10, 4, 0) });
@@ -58,34 +77,68 @@ public sealed class MainForm : Form
         panel.Controls.Add(new Label { Text = "Width", AutoSize = true, Margin = new Padding(16, 10, 4, 0) });
         panel.Controls.Add(_width);
         panel.SetFlowBreak(_width, true);
-        _status.Margin = new Padding(4, 16, 4, 4);
+
+        panel.Controls.Add(_sendAudio);
+        panel.Controls.Add(_receiveMic);
+        panel.SetFlowBreak(_receiveMic, true);
+
+        _status.Margin = new Padding(4, 18, 4, 4);
         panel.Controls.Add(_status);
         Controls.Add(panel);
 
+        RefreshDisplays();
+        _refreshDisplays.Click += (_, _) => RefreshDisplays();
         _start.Click += async (_, _) => await StartAsync();
         _stop.Click += (_, _) => StopStreaming();
         FormClosing += (_, _) => StopStreaming();
+
+        if (autoStart)
+            Shown += async (_, _) => await StartAsync();
+    }
+
+    private void RefreshDisplays()
+    {
+        var current = (_display.SelectedItem as DisplayChoice)?.DeviceName;
+        _display.Items.Clear();
+
+        foreach (var screen in Screen.AllScreens)
+        {
+            var tag = screen.Primary ? "PRIMARY" : "EXTENDED";
+            _display.Items.Add(new DisplayChoice(screen.DeviceName, screen.Bounds, $"{screen.DeviceName} — {screen.Bounds.Width}x{screen.Bounds.Height} — {tag}"));
+        }
+
+        var choices = _display.Items.Cast<DisplayChoice>().ToList();
+        var selected = choices.FirstOrDefault(x => x.DeviceName == current)
+            ?? choices.FirstOrDefault(x => !x.Label.Contains("PRIMARY", StringComparison.Ordinal))
+            ?? choices.FirstOrDefault();
+
+        if (selected is not null)
+            _display.SelectedItem = selected;
     }
 
     private async Task StartAsync()
     {
+        if (_starting || _cts is not null) return;
+        _starting = true;
         _start.Enabled = false;
         TcpListener? listener = null;
 
         try
         {
+            RefreshDisplays();
+            if (_display.Items.Count < 2)
+                SetStatus("Only one Windows display is visible. Install/enable the virtual display driver, then run DisplaySwitch /extend.");
+
             SetStatus("Checking ADB device…");
             var adb = FindAdb();
             var devicesOutput = await RunProcessAsync(adb, "devices");
             var serial = ParseFirstAuthorizedDevice(devicesOutput);
             if (serial is null)
-                throw new InvalidOperationException("No authorized Android device found. Enable USB debugging and approve the computer on the tablet.");
+                throw new InvalidOperationException("No authorized Android device found. Enable USB debugging and approve this computer on the tablet.");
 
             _adbPath = adb;
             _deviceSerial = serial;
 
-            // Let Windows choose a free local port instead of always binding 27183.
-            // The tablet still connects to 27183; ADB maps that device port to this free host port.
             listener = new TcpListener(IPAddress.Loopback, 0);
             listener.Start(1);
             var hostPort = ((IPEndPoint)listener.LocalEndpoint).Port;
@@ -102,7 +155,7 @@ public sealed class MainForm : Form
 
             SetStatus($"Waiting for tablet over USB… PC port {hostPort}");
             _ = Task.Run(() => AcceptAndStreamAsync(listener, _cts.Token, adb, serial));
-            listener = null; // ownership transferred to AcceptAndStreamAsync
+            listener = null;
         }
         catch (Exception ex)
         {
@@ -112,54 +165,52 @@ public sealed class MainForm : Form
             _start.Enabled = true;
             _stop.Enabled = false;
         }
+        finally
+        {
+            _starting = false;
+        }
     }
 
     private async Task AcceptAndStreamAsync(TcpListener listener, CancellationToken token, string adb, string serial)
     {
+        using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var sessionToken = sessionCts.Token;
+
         try
         {
-            using var client = await listener.AcceptTcpClientAsync(token);
+            using var client = await listener.AcceptTcpClientAsync(sessionToken);
             client.NoDelay = true;
-            Invoke(new Action(() => SetStatus("USB connected — streaming screen.")));
+            using var stream = client.GetStream();
 
-            using var stream = new BufferedStream(client.GetStream(), 512 * 1024);
-            var encoder = ImageCodecInfo.GetImageEncoders().First(x => x.FormatID == ImageFormat.Jpeg.Guid);
+            var (sendAudio, receiveMic) = ReadAudioOptions();
+            using var micSink = receiveMic ? TryCreateVirtualMicSink() : null;
 
-            while (!token.IsCancellationRequested && client.Connected)
+            var micText = !receiveMic
+                ? "mic off"
+                : micSink is null
+                    ? "mic endpoint not found"
+                    : "mic ready";
+            Invoke(new Action(() => SetStatus($"USB connected — extended display + audio; {micText}.")));
+
+            var channel = Channel.CreateBounded<Packet>(new BoundedChannelOptions(12)
             {
-                var started = Stopwatch.GetTimestamp();
-                var (targetWidth, quality, fps) = ReadSettings();
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false
+            });
 
-                using var source = CapturePrimaryScreen();
-                var targetHeight = Math.Max(1, (int)Math.Round(source.Height * (targetWidth / (double)source.Width)));
-                using var scaled = new Bitmap(targetWidth, targetHeight, PixelFormat.Format24bppRgb);
-                using (var g = Graphics.FromImage(scaled))
-                {
-                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
-                    g.DrawImage(source, 0, 0, targetWidth, targetHeight);
-                }
+            using var loopback = sendAudio ? TryCreateLoopbackStreamer(channel.Writer) : null;
 
-                using var ms = new MemoryStream(512 * 1024);
-                using (var p = new EncoderParameters(1))
-                {
-                    p.Param[0] = new EncoderParameter(Encoder.Quality, quality);
-                    scaled.Save(ms, encoder, p);
-                }
+            var sender = SendPacketsAsync(stream, channel.Reader, sessionToken);
+            var video = ProduceVideoAsync(channel.Writer, sessionToken);
+            var mic = ReceiveMicAsync(stream, micSink, sessionToken);
 
-                var bytes = ms.GetBuffer();
-                var count = checked((int)ms.Length);
-                var header = new byte[4];
-                BinaryPrimitives.WriteInt32BigEndian(header, count);
+            var finished = await Task.WhenAny(sender, video, mic);
+            sessionCts.Cancel();
+            channel.Writer.TryComplete();
 
-                await stream.WriteAsync(header, token);
-                await stream.WriteAsync(bytes.AsMemory(0, count), token);
-                await stream.FlushAsync(token);
-
-                var elapsed = Stopwatch.GetElapsedTime(started);
-                var delay = TimeSpan.FromSeconds(1.0 / fps) - elapsed;
-                if (delay > TimeSpan.Zero)
-                    await Task.Delay(delay, token);
-            }
+            try { await Task.WhenAll(sender, video, mic); } catch (OperationCanceledException) { }
+            await finished;
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -192,9 +243,105 @@ public sealed class MainForm : Form
         }
     }
 
-    private static Bitmap CapturePrimaryScreen()
+    private async Task ProduceVideoAsync(ChannelWriter<Packet> writer, CancellationToken token)
     {
-        var bounds = Screen.PrimaryScreen?.Bounds ?? throw new InvalidOperationException("Primary screen not found.");
+        var encoder = ImageCodecInfo.GetImageEncoders().First(x => x.FormatID == ImageFormat.Jpeg.Guid);
+
+        while (!token.IsCancellationRequested)
+        {
+            var started = Stopwatch.GetTimestamp();
+            var (targetWidth, quality, fps, bounds) = ReadVideoSettings();
+
+            using var source = CaptureScreen(bounds);
+            var targetHeight = Math.Max(1, (int)Math.Round(source.Height * (targetWidth / (double)source.Width)));
+            using var scaled = new Bitmap(targetWidth, targetHeight, PixelFormat.Format24bppRgb);
+            using (var g = Graphics.FromImage(scaled))
+            {
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
+                g.DrawImage(source, 0, 0, targetWidth, targetHeight);
+            }
+
+            using var ms = new MemoryStream(512 * 1024);
+            using (var p = new EncoderParameters(1))
+            {
+                p.Param[0] = new EncoderParameter(Encoder.Quality, quality);
+                scaled.Save(ms, encoder, p);
+            }
+
+            writer.TryWrite(new Packet(PacketVideo, ms.ToArray()));
+
+            var elapsed = Stopwatch.GetElapsedTime(started);
+            var delay = TimeSpan.FromSeconds(1.0 / fps) - elapsed;
+            if (delay > TimeSpan.Zero)
+                await Task.Delay(delay, token);
+        }
+    }
+
+    private static async Task SendPacketsAsync(NetworkStream stream, ChannelReader<Packet> reader, CancellationToken token)
+    {
+        await foreach (var packet in reader.ReadAllAsync(token))
+        {
+            var header = new byte[5];
+            header[0] = packet.Type;
+            BinaryPrimitives.WriteInt32BigEndian(header.AsSpan(1, 4), packet.Payload.Length);
+            await stream.WriteAsync(header, token);
+            await stream.WriteAsync(packet.Payload, token);
+        }
+    }
+
+    private static async Task ReceiveMicAsync(NetworkStream stream, VirtualMicSink? micSink, CancellationToken token)
+    {
+        var header = new byte[5];
+
+        while (!token.IsCancellationRequested)
+        {
+            await stream.ReadExactlyAsync(header, token);
+            var type = header[0];
+            var length = BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(1, 4));
+            if (length < 0 || length > 2_000_000)
+                throw new InvalidDataException($"Invalid incoming USB packet: {length} bytes.");
+
+            var payload = new byte[length];
+            await stream.ReadExactlyAsync(payload, token);
+
+            if (type == PacketMic && micSink is not null)
+                micSink.AddMonoPcm16(payload);
+        }
+    }
+
+    private LoopbackStreamer? TryCreateLoopbackStreamer(ChannelWriter<Packet> writer)
+    {
+        try
+        {
+            return new LoopbackStreamer(writer);
+        }
+        catch (Exception ex)
+        {
+            if (!IsDisposed)
+                BeginInvoke(new Action(() => SetStatus("Video connected; Windows audio capture unavailable: " + ex.Message)));
+            return null;
+        }
+    }
+
+    private VirtualMicSink? TryCreateVirtualMicSink()
+    {
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            var device = enumerator
+                .EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
+                .FirstOrDefault(d => d.FriendlyName.Contains("Voicemeeter Input", StringComparison.OrdinalIgnoreCase));
+
+            return device is null ? null : new VirtualMicSink(device);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static Bitmap CaptureScreen(Rectangle bounds)
+    {
         var bitmap = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format24bppRgb);
         using var graphics = Graphics.FromImage(bitmap);
         graphics.CopyFromScreen(bounds.X, bounds.Y, 0, 0, bounds.Size, CopyPixelOperation.SourceCopy);
@@ -266,22 +413,169 @@ public sealed class MainForm : Form
         using var process = Process.Start(psi) ?? throw new InvalidOperationException("Could not start " + file);
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
-
         await process.WaitForExitAsync();
         return (process.ExitCode, await stdoutTask, await stderrTask);
     }
 
-    private (int width, long quality, int fps) ReadSettings()
+    private (int width, long quality, int fps, Rectangle bounds) ReadVideoSettings()
     {
         if (InvokeRequired)
         {
-            return ((int width, long quality, int fps))Invoke(
-                new Func<(int width, long quality, int fps)>(ReadSettings)
+            return ((int width, long quality, int fps, Rectangle bounds))Invoke(
+                new Func<(int width, long quality, int fps, Rectangle bounds)>(ReadVideoSettings)
             );
         }
 
-        return ((int)_width.Value, (long)_quality.Value, (int)_fps.Value);
+        var choice = _display.SelectedItem as DisplayChoice
+            ?? throw new InvalidOperationException("No Windows display selected.");
+
+        return ((int)_width.Value, (long)_quality.Value, (int)_fps.Value, choice.Bounds);
+    }
+
+    private (bool sendAudio, bool receiveMic) ReadAudioOptions()
+    {
+        if (InvokeRequired)
+        {
+            return ((bool sendAudio, bool receiveMic))Invoke(
+                new Func<(bool sendAudio, bool receiveMic)>(ReadAudioOptions)
+            );
+        }
+
+        return (_sendAudio.Checked, _receiveMic.Checked);
     }
 
     private void SetStatus(string text) => _status.Text = text;
+
+    private sealed record Packet(byte Type, byte[] Payload);
+
+    private sealed class DisplayChoice
+    {
+        public string DeviceName { get; }
+        public Rectangle Bounds { get; }
+        public string Label { get; }
+
+        public DisplayChoice(string deviceName, Rectangle bounds, string label)
+        {
+            DeviceName = deviceName;
+            Bounds = bounds;
+            Label = label;
+        }
+
+        public override string ToString() => Label;
+    }
+
+    private sealed class LoopbackStreamer : IDisposable
+    {
+        private readonly WasapiLoopbackCapture _capture;
+        private readonly ChannelWriter<Packet> _writer;
+
+        public LoopbackStreamer(ChannelWriter<Packet> writer)
+        {
+            _writer = writer;
+            _capture = new WasapiLoopbackCapture();
+            _capture.DataAvailable += OnDataAvailable;
+            _capture.StartRecording();
+        }
+
+        private void OnDataAvailable(object? sender, WaveInEventArgs e)
+        {
+            try
+            {
+                var pcm = ConvertToStereoPcm16(e.Buffer, e.BytesRecorded, _capture.WaveFormat);
+                if (pcm.Length == 0) return;
+
+                var payload = new byte[4 + pcm.Length];
+                BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(0, 4), _capture.WaveFormat.SampleRate);
+                Buffer.BlockCopy(pcm, 0, payload, 4, pcm.Length);
+                _writer.TryWrite(new Packet(PacketAudio, payload));
+            }
+            catch
+            {
+                // Keep video alive if the system mix format changes unexpectedly.
+            }
+        }
+
+        private static byte[] ConvertToStereoPcm16(byte[] source, int count, WaveFormat format)
+        {
+            var channels = Math.Max(1, format.Channels);
+            var bytesPerSample = Math.Max(1, format.BitsPerSample / 8);
+            var frameSize = Math.Max(bytesPerSample * channels, format.BlockAlign);
+            var frames = count / frameSize;
+            var output = new byte[frames * 4];
+
+            for (var frame = 0; frame < frames; frame++)
+            {
+                var baseOffset = frame * frameSize;
+                var left = ReadSample(source, baseOffset, bytesPerSample);
+                var right = channels > 1
+                    ? ReadSample(source, baseOffset + bytesPerSample, bytesPerSample)
+                    : left;
+
+                var l = (short)Math.Clamp((int)Math.Round(left * 32767f), short.MinValue, short.MaxValue);
+                var r = (short)Math.Clamp((int)Math.Round(right * 32767f), short.MinValue, short.MaxValue);
+                BinaryPrimitives.WriteInt16LittleEndian(output.AsSpan(frame * 4, 2), l);
+                BinaryPrimitives.WriteInt16LittleEndian(output.AsSpan(frame * 4 + 2, 2), r);
+            }
+
+            return output;
+        }
+
+        private static float ReadSample(byte[] buffer, int offset, int bytesPerSample)
+        {
+            if (bytesPerSample == 4)
+                return Math.Clamp(BitConverter.ToSingle(buffer, offset), -1f, 1f);
+            if (bytesPerSample == 2)
+                return BitConverter.ToInt16(buffer, offset) / 32768f;
+            return 0f;
+        }
+
+        public void Dispose()
+        {
+            try { _capture.StopRecording(); } catch { }
+            _capture.DataAvailable -= OnDataAvailable;
+            _capture.Dispose();
+        }
+    }
+
+    private sealed class VirtualMicSink : IDisposable
+    {
+        private readonly BufferedWaveProvider _buffer;
+        private readonly WasapiOut _output;
+
+        public VirtualMicSink(MMDevice device)
+        {
+            _buffer = new BufferedWaveProvider(new WaveFormat(48000, 16, 2))
+            {
+                BufferDuration = TimeSpan.FromSeconds(1),
+                DiscardOnBufferOverflow = true
+            };
+
+            _output = new WasapiOut(device, AudioClientShareMode.Shared, false, 50);
+            _output.Init(_buffer);
+            _output.Play();
+        }
+
+        public void AddMonoPcm16(byte[] mono)
+        {
+            if (mono.Length < 2) return;
+            var stereo = new byte[(mono.Length / 2) * 4];
+            var dst = 0;
+
+            for (var src = 0; src + 1 < mono.Length; src += 2)
+            {
+                stereo[dst++] = mono[src];
+                stereo[dst++] = mono[src + 1];
+                stereo[dst++] = mono[src];
+                stereo[dst++] = mono[src + 1];
+            }
+
+            _buffer.AddSamples(stereo, 0, dst);
+        }
+
+        public void Dispose()
+        {
+            try { _output.Stop(); } catch { }
+            _output.Dispose();
+        }
+    }
 }

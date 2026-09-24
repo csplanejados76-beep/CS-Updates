@@ -1,8 +1,8 @@
-# CS USB Display v0.2.0
+# CS USB Display v0.2.1
 
 Transforma um tablet Android em segunda tela estendida do Windows usando somente cabo USB.
 
-## Recursos da v0.2.0
+## Recursos da v0.2.x
 
 - transporte de dados via USB usando ADB reverse
 - segunda tela estendida real no Windows usando Virtual Display Driver
@@ -70,3 +70,10 @@ Cada pacote usa 1 byte de tipo, 4 bytes big-endian de comprimento e o payload.
 ## Observacao
 
 Audio no Windows nao pertence fisicamente a um monitor. A v0.2.0 envia ao tablet o dispositivo de reproducao padrao do Windows. O video vem especificamente da segunda tela selecionada.
+
+## Correcoes da v0.2.1
+
+- corrige corrida de inicializacao que podia zerar o TcpListener e gerar NullReferenceException logo apos conectar
+- impede iniciar em modo estendido quando o Windows ainda reconhece somente uma tela
+- PowerShell aguarda a segunda tela virtual aparecer e abre Configuracoes de Tela se o driver ainda nao estiver ativo
+- grava diagnostico do host em %LOCALAPPDATA%\\CS USB Display\\host.log quando ocorre uma excecao

@@ -1,0 +1,59 @@
+name: Build CS USB Display
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'feature/cs-usb-display-*'
+    paths:
+      - 'CS-USB-Display/**'
+      - '.github/workflows/build-cs-usb-display.yml'
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: CS-USB-Display/android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build APK
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk ../../CS-USB-Display.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CS-USB-Display-APK
+          path: CS-USB-Display/CS-USB-Display.apk
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Publish Windows host
+        shell: pwsh
+        run: |
+          dotnet publish CS-USB-Display/windows/CSUsbDisplayHost/CSUsbDisplayHost.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o out/windows
+      - name: Bundle ADB platform-tools
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile platform-tools.zip
+          Expand-Archive platform-tools.zip -DestinationPath out/windows -Force
+      - name: Package Windows program
+        shell: pwsh
+        run: Compress-Archive -Path out/windows/* -DestinationPath CS-USB-Display-Windows.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CS-USB-Display-Windows
+          path: CS-USB-Display-Windows.zip

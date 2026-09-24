@@ -5,7 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Host.UI.RawUI.WindowTitle = "CS USB Display v0.2.0"
+$Host.UI.RawUI.WindowTitle = "CS USB Display v0.2.1"
 
 function Write-Step([string]$Text) {
     Write-Host ""
@@ -84,7 +84,7 @@ function Install-VBCable {
     Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "CS USB Display v0.2.0" -ForegroundColor Green
+Write-Host "CS USB Display v0.2.1" -ForegroundColor Green
 Write-Host "Segunda tela estendida + audio do PC + microfone do tablet via USB"
 
 if (-not $SkipDependencyCheck) {
@@ -131,7 +131,24 @@ if (-not $SkipDependencyCheck) {
 Write-Step "Ativando modo Estender"
 $displaySwitch = Join-Path $env:WINDIR "System32\DisplaySwitch.exe"
 Start-Process -FilePath $displaySwitch -ArgumentList "/extend" -Wait
-Start-Sleep -Seconds 2
+
+Add-Type -AssemblyName System.Windows.Forms
+$screenCount = 0
+for ($i = 0; $i -lt 10; $i++) {
+    Start-Sleep -Seconds 1
+    $screenCount = [System.Windows.Forms.Screen]::AllScreens.Count
+    if ($screenCount -ge 2) { break }
+}
+
+if ($screenCount -lt 2) {
+    Write-Host ""
+    Write-Warning "O Windows ainda mostra somente uma tela."
+    Write-Host "A segunda tela virtual precisa aparecer em Configuracoes > Sistema > Tela antes de iniciar." -ForegroundColor Yellow
+    Write-Host "Se o Virtual Display Driver acabou de ser instalado, reinicie o Windows e execute este script novamente." -ForegroundColor Yellow
+    Start-Process "ms-settings:display"
+    Read-Host "Pressione ENTER para sair"
+    exit 1
+}
 
 $hostExe = Join-Path $PSScriptRoot "CSUsbDisplayHost.exe"
 if (-not (Test-Path $hostExe)) {

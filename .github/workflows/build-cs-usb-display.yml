@@ -29,11 +29,12 @@ jobs:
       - name: Build APK
         run: gradle --no-daemon :app:assembleDebug
       - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk ../../CS-USB-Display.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk ../CS-USB-Display.apk
       - uses: actions/upload-artifact@v4
         with:
           name: CS-USB-Display-APK
           path: CS-USB-Display/CS-USB-Display.apk
+          if-no-files-found: error
 
   windows:
     runs-on: windows-latest
@@ -58,3 +59,4 @@ jobs:
         with:
           name: CS-USB-Display-Windows
           path: CS-USB-Display-Windows.zip
+          if-no-files-found: error

@@ -64,9 +64,9 @@ jobs:
           Expand-Archive platform-tools.zip -DestinationPath out/windows -Force
       - name: Package Windows program
         shell: pwsh
-        run: Compress-Archive -Path out/windows/* -DestinationPath CS-USB-Display-Windows-v0.2.0.zip -Force
+        run: Compress-Archive -Path out/windows/* -DestinationPath CS-USB-Display-Windows-v0.2.1.zip -Force
       - uses: actions/upload-artifact@v4
         with:
-          name: CS-USB-Display-Windows-v0.2.0
-          path: CS-USB-Display-Windows-v0.2.0.zip
+          name: CS-USB-Display-Windows-v0.2.1
+          path: CS-USB-Display-Windows-v0.2.1.zip
           if-no-files-found: error

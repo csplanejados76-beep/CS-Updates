@@ -18,19 +18,22 @@ internal static class Program
 
 public sealed class MainForm : Form
 {
-    private const int Port = 27183;
+    private const int DevicePort = 27183;
     private readonly Button _start = new() { Text = "Connect / Start", Width = 150, Height = 36 };
     private readonly Button _stop = new() { Text = "Stop", Width = 90, Height = 36, Enabled = false };
     private readonly Label _status = new() { AutoSize = true, Text = "Ready. Connect the tablet by USB." };
     private readonly NumericUpDown _fps = new() { Minimum = 5, Maximum = 30, Value = 20, Width = 60 };
     private readonly NumericUpDown _quality = new() { Minimum = 30, Maximum = 90, Value = 55, Width = 60 };
     private readonly NumericUpDown _width = new() { Minimum = 640, Maximum = 2560, Increment = 160, Value = 1280, Width = 80 };
+
     private CancellationTokenSource? _cts;
     private TcpListener? _listener;
+    private string? _adbPath;
+    private string? _deviceSerial;
 
     public MainForm()
     {
-        Text = "CS USB Display v0.1.0";
+        Text = "CS USB Display v0.1.1";
         Width = 540;
         Height = 250;
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -67,41 +70,58 @@ public sealed class MainForm : Form
     private async Task StartAsync()
     {
         _start.Enabled = false;
+        TcpListener? listener = null;
+
         try
         {
             SetStatus("Checking ADB device…");
             var adb = FindAdb();
-            var devices = await RunProcessAsync(adb, "devices");
-            var connected = devices.Split('\n').Any(x => x.TrimEnd().EndsWith("\tdevice", StringComparison.Ordinal));
-            if (!connected)
+            var devicesOutput = await RunProcessAsync(adb, "devices");
+            var serial = ParseFirstAuthorizedDevice(devicesOutput);
+            if (serial is null)
                 throw new InvalidOperationException("No authorized Android device found. Enable USB debugging and approve the computer on the tablet.");
 
-            SetStatus("Creating USB tunnel…");
-            await RunProcessAsync(adb, $"reverse tcp:{Port} tcp:{Port}");
-            _ = RunProcessAsync(adb, "shell am start -n com.cs.usbdisplay/.MainActivity");
+            _adbPath = adb;
+            _deviceSerial = serial;
+
+            // Let Windows choose a free local port instead of always binding 27183.
+            // The tablet still connects to 27183; ADB maps that device port to this free host port.
+            listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start(1);
+            var hostPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+            SetStatus($"Creating USB tunnel (tablet {DevicePort} → PC {hostPort})…");
+            await RunProcessAllowFailureAsync(adb, $"-s {serial} reverse --remove tcp:{DevicePort}");
+            await RunProcessAsync(adb, $"-s {serial} reverse tcp:{DevicePort} tcp:{hostPort}");
 
             _cts = new CancellationTokenSource();
-            _listener = new TcpListener(IPAddress.Any, Port);
-            _listener.Start(1);
+            _listener = listener;
             _stop.Enabled = true;
-            SetStatus("Waiting for tablet app over USB…");
-            _ = Task.Run(() => AcceptAndStreamAsync(_cts.Token));
+
+            _ = RunProcessAllowFailureAsync(adb, $"-s {serial} shell am start -n com.cs.usbdisplay/.MainActivity");
+
+            SetStatus($"Waiting for tablet over USB… PC port {hostPort}");
+            _ = Task.Run(() => AcceptAndStreamAsync(listener, _cts.Token, adb, serial));
+            listener = null; // ownership transferred to AcceptAndStreamAsync
         }
         catch (Exception ex)
         {
+            try { listener?.Stop(); } catch { }
+            await RemoveReverseAsync();
             SetStatus("Error: " + ex.Message);
             _start.Enabled = true;
             _stop.Enabled = false;
         }
     }
 
-    private async Task AcceptAndStreamAsync(CancellationToken token)
+    private async Task AcceptAndStreamAsync(TcpListener listener, CancellationToken token, string adb, string serial)
     {
         try
         {
-            using var client = await _listener!.AcceptTcpClientAsync(token);
+            using var client = await listener.AcceptTcpClientAsync(token);
             client.NoDelay = true;
             Invoke(new Action(() => SetStatus("USB connected — streaming screen.")));
+
             using var stream = new BufferedStream(client.GetStream(), 512 * 1024);
             var encoder = ImageCodecInfo.GetImageEncoders().First(x => x.FormatID == ImageFormat.Jpeg.Guid);
 
@@ -125,31 +145,50 @@ public sealed class MainForm : Form
                     p.Param[0] = new EncoderParameter(Encoder.Quality, quality);
                     scaled.Save(ms, encoder, p);
                 }
+
                 var bytes = ms.GetBuffer();
                 var count = checked((int)ms.Length);
-                var header = new byte[4];
+                Span<byte> header = stackalloc byte[4];
                 BinaryPrimitives.WriteInt32BigEndian(header, count);
-                await stream.WriteAsync(header, token);
+
+                await stream.WriteAsync(header.ToArray(), token);
                 await stream.WriteAsync(bytes.AsMemory(0, count), token);
                 await stream.FlushAsync(token);
 
                 var elapsed = Stopwatch.GetElapsedTime(started);
                 var delay = TimeSpan.FromSeconds(1.0 / fps) - elapsed;
-                if (delay > TimeSpan.Zero) await Task.Delay(delay, token);
+                if (delay > TimeSpan.Zero)
+                    await Task.Delay(delay, token);
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            if (!IsDisposed) BeginInvoke(new Action(() => SetStatus("Connection ended: " + ex.Message)));
+            if (!IsDisposed)
+                BeginInvoke(new Action(() => SetStatus("Connection ended: " + ex.Message)));
         }
         finally
         {
-            if (!IsDisposed) BeginInvoke(new Action(() =>
+            try { listener.Stop(); } catch { }
+            await RunProcessAllowFailureAsync(adb, $"-s {serial} reverse --remove tcp:{DevicePort}");
+
+            if (!IsDisposed)
             {
-                _start.Enabled = true;
-                _stop.Enabled = false;
-            }));
+                BeginInvoke(new Action(() =>
+                {
+                    if (ReferenceEquals(_listener, listener))
+                    {
+                        _listener = null;
+                        _cts?.Dispose();
+                        _cts = null;
+                        _adbPath = null;
+                        _deviceSerial = null;
+                    }
+
+                    _start.Enabled = true;
+                    _stop.Enabled = false;
+                }));
+            }
         }
     }
 
@@ -166,12 +205,32 @@ public sealed class MainForm : Form
     {
         try { _cts?.Cancel(); } catch { }
         try { _listener?.Stop(); } catch { }
-        _cts?.Dispose();
-        _cts = null;
-        _listener = null;
+
+        var adb = _adbPath;
+        var serial = _deviceSerial;
+        if (!string.IsNullOrWhiteSpace(adb) && !string.IsNullOrWhiteSpace(serial))
+            _ = RunProcessAllowFailureAsync(adb, $"-s {serial} reverse --remove tcp:{DevicePort}");
+
         _start.Enabled = true;
         _stop.Enabled = false;
         SetStatus("Stopped.");
+    }
+
+    private async Task RemoveReverseAsync()
+    {
+        if (!string.IsNullOrWhiteSpace(_adbPath) && !string.IsNullOrWhiteSpace(_deviceSerial))
+            await RunProcessAllowFailureAsync(_adbPath, $"-s {_deviceSerial} reverse --remove tcp:{DevicePort}");
+    }
+
+    private static string? ParseFirstAuthorizedDevice(string adbDevicesOutput)
+    {
+        foreach (var line in adbDevicesOutput.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.EndsWith("\tdevice", StringComparison.Ordinal))
+                return trimmed[..trimmed.IndexOf('\t')];
+        }
+        return null;
     }
 
     private static string FindAdb()
@@ -183,6 +242,19 @@ public sealed class MainForm : Form
 
     private static async Task<string> RunProcessAsync(string file, string args)
     {
+        var (exitCode, stdout, stderr) = await RunProcessCoreAsync(file, args);
+        if (exitCode != 0)
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(stderr) ? stdout.Trim() : stderr.Trim());
+        return stdout;
+    }
+
+    private static async Task RunProcessAllowFailureAsync(string file, string args)
+    {
+        try { await RunProcessCoreAsync(file, args); } catch { }
+    }
+
+    private static async Task<(int exitCode, string stdout, string stderr)> RunProcessCoreAsync(string file, string args)
+    {
         var psi = new ProcessStartInfo(file, args)
         {
             UseShellExecute = false,
@@ -190,12 +262,13 @@ public sealed class MainForm : Form
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+
         using var process = Process.Start(psi) ?? throw new InvalidOperationException("Could not start " + file);
-        var stdout = await process.StandardOutput.ReadToEndAsync();
-        var stderr = await process.StandardError.ReadToEndAsync();
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+
         await process.WaitForExitAsync();
-        if (process.ExitCode != 0) throw new InvalidOperationException(string.IsNullOrWhiteSpace(stderr) ? stdout.Trim() : stderr.Trim());
-        return stdout;
+        return (process.ExitCode, await stdoutTask, await stderrTask);
     }
 
     private (int width, long quality, int fps) ReadSettings()
@@ -206,6 +279,7 @@ public sealed class MainForm : Form
                 new Func<(int width, long quality, int fps)>(ReadSettings)
             );
         }
+
         return ((int)_width.Value, (long)_quality.Value, (int)_fps.Value);
     }
 

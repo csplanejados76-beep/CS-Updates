@@ -328,9 +328,14 @@ public sealed class MainForm : Form
         try
         {
             using var enumerator = new MMDeviceEnumerator();
-            var device = enumerator
+            var devices = enumerator
                 .EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-                .FirstOrDefault(d => d.FriendlyName.Contains("Voicemeeter Input", StringComparison.OrdinalIgnoreCase));
+                .ToList();
+
+            var device = devices.FirstOrDefault(d =>
+                    d.FriendlyName.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase))
+                ?? devices.FirstOrDefault(d =>
+                    d.FriendlyName.Contains("Voicemeeter Input", StringComparison.OrdinalIgnoreCase));
 
             return device is null ? null : new VirtualMicSink(device);
         }

@@ -148,10 +148,10 @@ public sealed class MainForm : Form
 
                 var bytes = ms.GetBuffer();
                 var count = checked((int)ms.Length);
-                Span<byte> header = stackalloc byte[4];
+                var header = new byte[4];
                 BinaryPrimitives.WriteInt32BigEndian(header, count);
 
-                await stream.WriteAsync(header.ToArray(), token);
+                await stream.WriteAsync(header, token);
                 await stream.WriteAsync(bytes.AsMemory(0, count), token);
                 await stream.FlushAsync(token);
 

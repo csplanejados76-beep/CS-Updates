@@ -46,7 +46,7 @@ public sealed class MainForm : Form
 
     public MainForm(bool autoStart)
     {
-        Text = "CS USB Display v0.2.0 — Extended + Audio + Mic";
+        Text = "CS USB Display v0.2.1 — Extended + Audio + Mic";
         Width = 760;
         Height = 310;
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -127,7 +127,7 @@ public sealed class MainForm : Form
         {
             RefreshDisplays();
             if (_display.Items.Count < 2)
-                SetStatus("Only one Windows display is visible. Install/enable the virtual display driver, then run DisplaySwitch /extend.");
+                throw new InvalidOperationException("Somente a tela principal foi detectada. Instale/ative o Virtual Display Driver e execute o modo Estender antes de conectar.");
 
             SetStatus("Checking ADB device…");
             var adb = FindAdb();
@@ -154,13 +154,21 @@ public sealed class MainForm : Form
             _ = RunProcessAllowFailureAsync(adb, $"-s {serial} shell am start -n com.cs.usbdisplay/.MainActivity");
 
             SetStatus($"Waiting for tablet over USB… PC port {hostPort}");
-            _ = Task.Run(() => AcceptAndStreamAsync(listener, _cts.Token, adb, serial));
+
+            // Capture stable references before clearing the local ownership variable.
+            // Lambdas capture variables by reference, so using 'listener' directly here
+            // could race with 'listener = null' and produce a NullReferenceException.
+            var activeListener = listener;
+            var activeCts = _cts;
+            _ = Task.Run(() => AcceptAndStreamAsync(activeListener, activeCts.Token, adb, serial));
+
             listener = null;
         }
         catch (Exception ex)
         {
             try { listener?.Stop(); } catch { }
             await RemoveReverseAsync();
+            WriteDiagnostic("StartAsync", ex);
             SetStatus("Error: " + ex.Message);
             _start.Enabled = true;
             _stop.Enabled = false;
@@ -215,6 +223,7 @@ public sealed class MainForm : Form
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
+            WriteDiagnostic("AcceptAndStreamAsync", ex);
             if (!IsDisposed)
                 BeginInvoke(new Action(() => SetStatus("Connection ended: " + ex.Message)));
         }
@@ -450,6 +459,27 @@ public sealed class MainForm : Form
     }
 
     private void SetStatus(string text) => _status.Text = text;
+
+    private static void WriteDiagnostic(string area, Exception ex)
+    {
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CS USB Display"
+            );
+            Directory.CreateDirectory(dir);
+            var file = Path.Combine(dir, "host.log");
+            File.AppendAllText(
+                file,
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {area}{Environment.NewLine}{ex}{Environment.NewLine}{Environment.NewLine}"
+            );
+        }
+        catch
+        {
+            // Diagnostics must never interrupt the display session.
+        }
+    }
 
     private sealed record Packet(byte Type, byte[] Payload);
 

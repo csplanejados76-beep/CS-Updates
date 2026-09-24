@@ -29,11 +29,11 @@ jobs:
       - name: Build APK
         run: gradle --no-daemon :app:assembleDebug
       - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk ../CS-USB-Display.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk ../CS-USB-Display-v0.2.0.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: CS-USB-Display-APK
-          path: CS-USB-Display/CS-USB-Display.apk
+          name: CS-USB-Display-APK-v0.2.0
+          path: CS-USB-Display/CS-USB-Display-v0.2.0.apk
           if-no-files-found: error
 
   windows:
@@ -43,10 +43,20 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+      - name: Validate PowerShell launcher
+        shell: pwsh
+        run: |
+          $source = Get-Content CS-USB-Display/PowerShell/Start-CSUSBDisplay.ps1 -Raw
+          [scriptblock]::Create($source) | Out-Null
       - name: Publish Windows host
         shell: pwsh
         run: |
           dotnet publish CS-USB-Display/windows/CSUsbDisplayHost/CSUsbDisplayHost.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o out/windows
+      - name: Bundle launcher and documentation
+        shell: pwsh
+        run: |
+          Copy-Item CS-USB-Display/PowerShell/Start-CSUSBDisplay.ps1 out/windows/Start-CSUSBDisplay.ps1
+          Copy-Item CS-USB-Display/README.md out/windows/README.md
       - name: Bundle ADB platform-tools
         shell: pwsh
         run: |
@@ -54,9 +64,9 @@ jobs:
           Expand-Archive platform-tools.zip -DestinationPath out/windows -Force
       - name: Package Windows program
         shell: pwsh
-        run: Compress-Archive -Path out/windows/* -DestinationPath CS-USB-Display-Windows.zip -Force
+        run: Compress-Archive -Path out/windows/* -DestinationPath CS-USB-Display-Windows-v0.2.0.zip -Force
       - uses: actions/upload-artifact@v4
         with:
-          name: CS-USB-Display-Windows
-          path: CS-USB-Display-Windows.zip
+          name: CS-USB-Display-Windows-v0.2.0
+          path: CS-USB-Display-Windows-v0.2.0.zip
           if-no-files-found: error
